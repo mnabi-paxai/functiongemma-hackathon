@@ -96,18 +96,18 @@ def generate_cloud(messages, tools):
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
     """
-    Fast-path + self-consistency + recursive decomposition hybrid inference.
+    Fast-path + self-consistency hybrid inference.
 
     Strategy:
-    1. Inject schema-derived type hints into every on-device call (no
-       hardcoded domain rules — generated entirely from the tools schema).
-    2. Fast path: single on-device run. If valid AND high-confidence ->
+    1. Fast path: single on-device run. If valid AND high-confidence ->
        return immediately (avoids extra samples for clear, easy cases).
-    3. Self-consistency: run N-1 more times, reusing the first run.
-       Argument-level majority voting: vote per argument independently
-       after reaching tool-name consensus (more signal than exact match).
-    4. Recursive decomposition of compound requests.
-    5. Cloud fallback.
+    2. Self-consistency: run N-1 more times, reusing the first run.
+       If a majority of valid outputs agree -> return on-device.
+    3. If no majority on the full message, decompose compound requests into
+       atomic sub-requests and apply fast-path + self-consistency to each.
+       - All succeed -> merge and return on-device.
+       - Any fails -> single cloud call with the original message.
+    4. Cloud fallback.
     """
     import re
     from collections import Counter
@@ -117,32 +117,6 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
     # ------------------------------------------------------------------ #
-
-    def _make_schema_hints(tool_list):
-        """
-        Build a concise type-constraint reminder derived purely from the
-        JSON schema of the provided tools. No hardcoded domain knowledge.
-        """
-        hints = []
-        for t in tool_list:
-            props = t.get("parameters", {}).get("properties", {})
-            for field, spec in props.items():
-                ftype = spec.get("type", "")
-                if ftype in ("integer", "number", "boolean", "array"):
-                    hints.append(f"'{t['name']}.{field}' must be {ftype}")
-        if not hints:
-            return None
-        return (
-            "Strict schema types — " + "; ".join(hints) +
-            ". Never use a string where a number or boolean is required."
-        )
-
-    def _augment_messages(msgs, tool_list):
-        """Prepend a schema-derived type hint as an extra system message."""
-        hint = _make_schema_hints(tool_list)
-        if hint:
-            return [{"role": "system", "content": hint}] + msgs
-        return msgs
 
     def _coerce(value, expected_type):
         if expected_type == "integer":
@@ -178,12 +152,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         return value
 
     def _validate(calls, tool_list):
-        """
-        Validate and type-coerce calls against tool schemas.
-        Rejects calls where coercion fails (wrong type that can't be fixed).
-        No arbitrary numeric range limits — self-consistency handles outliers.
-        Returns (corrected, is_valid).
-        """
+        """Validate and type-coerce calls. Returns (corrected, is_valid)."""
         if not calls:
             return calls, False
         tool_map = {t["name"]: t for t in tool_list}
@@ -202,81 +171,52 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             corrected_args = {}
             for k, v in args.items():
                 if k in props:
-                    expected = props[k]["type"]
-                    coerced = _coerce(v, expected)
-                    # Reject only genuine coercion failures (type still wrong after attempt)
-                    if expected == "integer" and not (isinstance(coerced, int) and not isinstance(coerced, bool)):
-                        return calls, False
-                    if expected == "number" and not isinstance(coerced, (int, float)):
-                        return calls, False
+                    coerced = _coerce(v, props[k]["type"])
+                    if props[k]["type"] in ("integer", "number") and isinstance(coerced, (int, float)):
+                        if coerced < -1000 or coerced > 1_000_000:
+                            return calls, False
                     corrected_args[k] = coerced
                 else:
                     corrected_args[k] = v
             corrected.append({"name": name, "arguments": corrected_args})
         return corrected, True
 
-    def _vote_calls(valid_runs, n):
-        """
-        Argument-level majority voting across valid runs.
-        1. Find the majority tool-name sequence.
-        2. Among agreeing runs, vote per argument independently.
-        This is strictly more informative than requiring exact full-call match.
-        Returns (voted_calls, best_confidence) or (None, 0).
-        """
-        if not valid_runs:
-            return None, 0
-
-        # Step 1: majority on ordered tool-name sequence
-        name_seqs = [tuple(c["name"] for c in r[0]) for r in valid_runs]
-        counts = Counter(name_seqs)
-        best_seq, count = counts.most_common(1)[0]
-
-        if count < max(2, n // 2 + 1):
-            return None, 0
-
-        # Step 2: runs that agree on the tool sequence
-        agreeing = [r for r in valid_runs if tuple(c["name"] for c in r[0]) == best_seq]
-
-        # Step 3: per-argument majority vote at each call position
-        result_calls = []
-        for i, name in enumerate(best_seq):
-            args_list = [r[0][i]["arguments"] for r in agreeing]
-            all_keys = set(k for args in args_list for k in args)
-            voted_args = {}
-            for key in all_keys:
-                values = [args[key] for args in args_list if key in args]
-                if not values:
-                    continue
-                # Vote by string representation; recover the original typed value
-                val_counts = Counter(str(v) for v in values)
-                winning_str = val_counts.most_common(1)[0][0]
-                voted_args[key] = next(v for v in values if str(v) == winning_str)
-            result_calls.append({"name": name, "arguments": voted_args})
-
-        best_conf = max(r[1] for r in agreeing)
-        return result_calls, best_conf
+    def _fingerprint(calls):
+        """Hashable key for a list of function calls (order-independent)."""
+        return tuple(sorted(
+            (c["name"], tuple(sorted((k, str(v)) for k, v in c["arguments"].items())))
+            for c in calls
+        ))
 
     def _self_consistent_with_first(first_run, msgs, tool_list, n=N_SAMPLES):
         """
-        Reuse first_run, run n-1 more times with schema hints, apply
-        argument-level voting. Returns (result_or_None, total_time_ms_spent).
+        Reuse first_run and run n-1 more times. Return majority-consensus
+        result or None. Returns (result_or_None, total_time_ms_spent).
         """
         corrected0, is_valid0 = _validate(first_run["function_calls"], tool_list)
         valid_runs = [(corrected0, first_run["confidence"])] if is_valid0 else []
         spent_time = first_run["total_time_ms"]
 
-        aug_msgs = _augment_messages(msgs, tool_list)
         for _ in range(n - 1):
-            local = generate_cactus(aug_msgs, tool_list)
+            local = generate_cactus(msgs, tool_list)
             spent_time += local["total_time_ms"]
             corrected, is_valid = _validate(local["function_calls"], tool_list)
             if is_valid:
                 valid_runs.append((corrected, local["confidence"]))
 
-        voted_calls, best_conf = _vote_calls(valid_runs, n)
-        if voted_calls is not None:
-            return {"function_calls": voted_calls, "confidence": best_conf,
-                    "total_time_ms": spent_time}, spent_time
+        if not valid_runs:
+            return None, spent_time
+
+        counts = Counter(_fingerprint(r[0]) for r in valid_runs)
+        best_key, count = counts.most_common(1)[0]
+
+        if count >= max(2, n // 2 + 1):
+            best = max(
+                (r for r in valid_runs if _fingerprint(r[0]) == best_key),
+                key=lambda r: r[1],
+            )
+            return {"function_calls": best[0], "confidence": best[1], "total_time_ms": spent_time}, spent_time
+
         return None, spent_time
 
     def _on_device(msgs, tool_list):
@@ -284,8 +224,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         Fast-path + self-consistency for a single request.
         Returns (result_or_None, total_time_ms_spent).
         """
-        aug_msgs = _augment_messages(msgs, tool_list)
-        first = generate_cactus(aug_msgs, tool_list)
+        first = generate_cactus(msgs, tool_list)
         corrected, is_valid = _validate(first["function_calls"], tool_list)
 
         # Fast path: valid + high confidence -> return after 1 sample.
