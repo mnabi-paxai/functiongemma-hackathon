@@ -96,23 +96,22 @@ def generate_cloud(messages, tools):
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
     """
-    Fast-path + self-consistency hybrid inference.
+    Self-consistency hybrid inference.
 
     Strategy:
-    1. Fast path: single on-device run. If valid AND high-confidence ->
-       return immediately (avoids extra samples for clear, easy cases).
-    2. Self-consistency: run N-1 more times, reusing the first run.
-       If a majority of valid outputs agree -> return on-device.
-    3. If no majority on the full message, decompose compound requests into
-       atomic sub-requests and apply fast-path + self-consistency to each.
-       - All succeed -> merge and return on-device.
-       - Any fails -> single cloud call with the original message.
+    1. Run on-device N times; validate each output against tool schemas.
+    2. If a majority of valid outputs agree -> return on-device (agreement is
+       a stronger correctness signal than single-run confidence).
+    3. If no majority on the full message, try decomposing compound requests
+       into atomic sub-requests and apply self-consistency to each.
+       - All sub-requests reach consensus -> merge and return on-device.
+       - Any sub-request fails -> single cloud call with the original message.
     4. Cloud fallback.
     """
     import re
     from collections import Counter
 
-    N_SAMPLES = 3
+    N_SAMPLES = 3  # number of on-device samples per self-consistency round
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
@@ -188,16 +187,15 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             for c in calls
         ))
 
-    def _self_consistent_with_first(first_run, msgs, tool_list, n=N_SAMPLES):
+    def _self_consistent(msgs, tool_list, n=N_SAMPLES):
         """
-        Reuse first_run and run n-1 more times. Return majority-consensus
-        result or None. Returns (result_or_None, total_time_ms_spent).
+        Run on-device n times, validate each, return the majority-consensus
+        result or None if no majority is found.
+        Returns (result_or_None, total_time_ms_spent).
         """
-        corrected0, is_valid0 = _validate(first_run["function_calls"], tool_list)
-        valid_runs = [(corrected0, first_run["confidence"])] if is_valid0 else []
-        spent_time = first_run["total_time_ms"]
-
-        for _ in range(n - 1):
+        valid_runs = []
+        spent_time = 0.0
+        for _ in range(n):
             local = generate_cactus(msgs, tool_list)
             spent_time += local["total_time_ms"]
             corrected, is_valid = _validate(local["function_calls"], tool_list)
@@ -210,6 +208,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         counts = Counter(_fingerprint(r[0]) for r in valid_runs)
         best_key, count = counts.most_common(1)[0]
 
+        # Require strict majority (>=2 out of N_SAMPLES)
         if count >= max(2, n // 2 + 1):
             best = max(
                 (r for r in valid_runs if _fingerprint(r[0]) == best_key),
@@ -218,22 +217,6 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             return {"function_calls": best[0], "confidence": best[1], "total_time_ms": spent_time}, spent_time
 
         return None, spent_time
-
-    def _on_device(msgs, tool_list):
-        """
-        Fast-path + self-consistency for a single request.
-        Returns (result_or_None, total_time_ms_spent).
-        """
-        first = generate_cactus(msgs, tool_list)
-        corrected, is_valid = _validate(first["function_calls"], tool_list)
-
-        # Fast path: valid + high confidence -> return after 1 sample.
-        if is_valid and first["confidence"] >= confidence_threshold:
-            return {"function_calls": corrected, "confidence": first["confidence"],
-                    "total_time_ms": first["total_time_ms"]}, first["total_time_ms"]
-
-        # Self-consistency: run N-1 more, reuse first.
-        return _self_consistent_with_first(first, msgs, tool_list)
 
     _VERBS = {
         "set", "send", "play", "get", "find", "search", "look", "check",
@@ -259,70 +242,37 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     # Main routing logic                                                   #
     # ------------------------------------------------------------------ #
 
-    user_msgs = [m for m in messages if m["role"] == "user"]
-    non_user  = [m for m in messages if m["role"] != "user"]
-
-    def _resolve(content, depth=0, max_depth=2):
-        """
-        Recursively resolve a request on-device.
-        1. Try fast-path + self-consistency on the content.
-        2. If that fails and depth < max_depth, decompose and recurse.
-        Returns (calls_list_or_None, time_ms_spent).
-        """
-        msgs = non_user + [{"role": "user", "content": content}]
-        result, time_spent = _on_device(msgs, tools)
-        if result is not None:
-            return result["function_calls"], time_spent
-
-        if depth < max_depth:
-            parts = _decompose(content)
-            if len(parts) > 1:
-                all_calls = []
-                total_time = time_spent
-                for part in parts:
-                    part_calls, part_time = _resolve(part, depth + 1, max_depth)
-                    total_time += part_time
-                    if part_calls is None:
-                        return None, total_time
-                    all_calls.extend(part_calls)
-                return all_calls, total_time
-
-        return None, time_spent
-
-    # Step 1 + 2: fast-path then self-consistency on the full message.
-    result, spent_time = _on_device(messages, tools)
+    # Step 1: self-consistency on the full message.
+    result, spent_time = _self_consistent(messages, tools)
     if result is not None:
         result["source"] = "on-device"
         return result
 
-    # Step 3: recursive decomposition.
+    # Step 2: try decomposing compound requests.
+    user_msgs = [m for m in messages if m["role"] == "user"]
+    non_user  = [m for m in messages if m["role"] != "user"]
+
     if user_msgs:
         sub_contents = _decompose(user_msgs[-1]["content"])
         if len(sub_contents) > 1:
             all_calls = []
-            total_time = spent_time
-            success = True
             for sub_content in sub_contents:
-                calls, sub_time = _resolve(sub_content)
-                total_time += sub_time
-                if calls is None:
-                    success = False
-                    break
-                all_calls.extend(calls)
+                sub_msgs = non_user + [{"role": "user", "content": sub_content}]
+                sub_result, sub_time = _self_consistent(sub_msgs, tools)
+                spent_time += sub_time
+                if sub_result is None:
+                    cloud = generate_cloud(messages, tools)
+                    cloud["source"] = "cloud (fallback)"
+                    cloud["total_time_ms"] += spent_time
+                    return cloud
+                all_calls.extend(sub_result["function_calls"])
+            return {
+                "function_calls": all_calls,
+                "total_time_ms": spent_time,
+                "source": "on-device",
+            }
 
-            if success:
-                return {
-                    "function_calls": all_calls,
-                    "total_time_ms": total_time,
-                    "source": "on-device",
-                }
-
-            cloud = generate_cloud(messages, tools)
-            cloud["source"] = "cloud (fallback)"
-            cloud["total_time_ms"] += total_time
-            return cloud
-
-    # Step 4: cloud fallback.
+    # Step 3: cloud fallback.
     cloud = generate_cloud(messages, tools)
     cloud["source"] = "cloud (fallback)"
     cloud["total_time_ms"] += spent_time

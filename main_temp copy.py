@@ -95,30 +95,38 @@ def generate_cloud(messages, tools):
 
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
+    '''
+    """Baseline hybrid inference strategy; fall back to cloud if Cactus Confidence is below threshold."""
+    local = generate_cactus(messages, tools)
+
+    if local["confidence"] >= confidence_threshold:
+        local["source"] = "on-device"
+        return local        
+    '''
+
     """
-    Fast-path + self-consistency hybrid inference.
+    On-device-first hybrid inference.
 
     Strategy:
-    1. Fast path: single on-device run. If valid AND high-confidence ->
-       return immediately (avoids extra samples for clear, easy cases).
-    2. Self-consistency: run N-1 more times, reusing the first run.
-       If a majority of valid outputs agree -> return on-device.
-    3. If no majority on the full message, decompose compound requests into
-       atomic sub-requests and apply fast-path + self-consistency to each.
-       - All succeed -> merge and return on-device.
-       - Any fails -> single cloud call with the original message.
-    4. Cloud fallback.
+    1. Try the full message on-device first.
+       - Validate output against tool schemas; apply type coercion.
+       - If valid and confident -> return on-device (preserves partial
+         multi-call results the model produces on its own).
+    2. If on-device fails, try splitting compound requests into atomic
+       sub-requests and running each on-device independently.
+       - If ALL sub-requests succeed -> return merged on-device result.
+       - If ANY sub-request fails -> fall back to cloud with the ORIGINAL
+         message (single round-trip; preserves cloud compound handling).
+    3. Cloud fallback with the original message.
     """
     import re
-    from collections import Counter
-
-    N_SAMPLES = 3
 
     # ------------------------------------------------------------------ #
-    # Helpers                                                              #
+    # Nested helpers                                                       #
     # ------------------------------------------------------------------ #
 
     def _coerce(value, expected_type):
+        """Coerce a value to the JSON schema primitive type."""
         if expected_type == "integer":
             if isinstance(value, int) and not isinstance(value, bool):
                 return value
@@ -152,7 +160,12 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         return value
 
     def _validate(calls, tool_list):
-        """Validate and type-coerce calls. Returns (corrected, is_valid)."""
+        """
+        Validate and type-correct function calls against tool schemas.
+        Returns (corrected_calls, is_valid).
+        is_valid=False for uncorrectable errors: unknown tool, missing
+        required field, or obviously garbage numeric value.
+        """
         if not calls:
             return calls, False
         tool_map = {t["name"]: t for t in tool_list}
@@ -172,6 +185,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             for k, v in args.items():
                 if k in props:
                     coerced = _coerce(v, props[k]["type"])
+                    # Reject clearly garbage numeric generation artifacts
                     if props[k]["type"] in ("integer", "number") and isinstance(coerced, (int, float)):
                         if coerced < -1000 or coerced > 1_000_000:
                             return calls, False
@@ -180,60 +194,6 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                     corrected_args[k] = v
             corrected.append({"name": name, "arguments": corrected_args})
         return corrected, True
-
-    def _fingerprint(calls):
-        """Hashable key for a list of function calls (order-independent)."""
-        return tuple(sorted(
-            (c["name"], tuple(sorted((k, str(v)) for k, v in c["arguments"].items())))
-            for c in calls
-        ))
-
-    def _self_consistent_with_first(first_run, msgs, tool_list, n=N_SAMPLES):
-        """
-        Reuse first_run and run n-1 more times. Return majority-consensus
-        result or None. Returns (result_or_None, total_time_ms_spent).
-        """
-        corrected0, is_valid0 = _validate(first_run["function_calls"], tool_list)
-        valid_runs = [(corrected0, first_run["confidence"])] if is_valid0 else []
-        spent_time = first_run["total_time_ms"]
-
-        for _ in range(n - 1):
-            local = generate_cactus(msgs, tool_list)
-            spent_time += local["total_time_ms"]
-            corrected, is_valid = _validate(local["function_calls"], tool_list)
-            if is_valid:
-                valid_runs.append((corrected, local["confidence"]))
-
-        if not valid_runs:
-            return None, spent_time
-
-        counts = Counter(_fingerprint(r[0]) for r in valid_runs)
-        best_key, count = counts.most_common(1)[0]
-
-        if count >= max(2, n // 2 + 1):
-            best = max(
-                (r for r in valid_runs if _fingerprint(r[0]) == best_key),
-                key=lambda r: r[1],
-            )
-            return {"function_calls": best[0], "confidence": best[1], "total_time_ms": spent_time}, spent_time
-
-        return None, spent_time
-
-    def _on_device(msgs, tool_list):
-        """
-        Fast-path + self-consistency for a single request.
-        Returns (result_or_None, total_time_ms_spent).
-        """
-        first = generate_cactus(msgs, tool_list)
-        corrected, is_valid = _validate(first["function_calls"], tool_list)
-
-        # Fast path: valid + high confidence -> return after 1 sample.
-        if is_valid and first["confidence"] >= confidence_threshold:
-            return {"function_calls": corrected, "confidence": first["confidence"],
-                    "total_time_ms": first["total_time_ms"]}, first["total_time_ms"]
-
-        # Self-consistency: run N-1 more, reuse first.
-        return _self_consistent_with_first(first, msgs, tool_list)
 
     _VERBS = {
         "set", "send", "play", "get", "find", "search", "look", "check",
@@ -244,14 +204,22 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     }
 
     def _decompose(message):
+        """
+        Split a compound user message into atomic sub-requests.
+        Returns [message] if no valid split is found.
+        """
+        # Primary: comma-based splits (", and " and ", ")
         parts = re.split(r',\s+and\s+|,\s+', message)
         parts = [re.sub(r'(?i)^and\s+', '', p).strip() for p in parts if p.strip()]
+
+        # Secondary: bare " and " only when both sides start with an action verb
         if len(parts) == 1:
             candidates = [p.strip() for p in re.split(r'\s+and\s+', message, flags=re.IGNORECASE)]
             if (len(candidates) > 1
                     and all(len(p.split()) >= 3 for p in candidates)
                     and all(p.split()[0].lower().rstrip("'s") in _VERBS for p in candidates)):
                 parts = candidates
+
         parts = [p for p in parts if len(p.split()) >= 2]
         return parts if len(parts) > 1 else [message]
 
@@ -259,75 +227,53 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     # Main routing logic                                                   #
     # ------------------------------------------------------------------ #
 
+    # Step 1: try the full message on-device.
+    local = generate_cactus(messages, tools)
+    corrected, is_valid = _validate(local["function_calls"], tools)
+
+    if is_valid and local["confidence"] >= confidence_threshold:
+        local["function_calls"] = corrected
+        local["source"] = "on-device"
+        return local
+
+    # Step 2: try decomposing compound requests into atomic sub-requests.
     user_msgs = [m for m in messages if m["role"] == "user"]
     non_user  = [m for m in messages if m["role"] != "user"]
 
-    def _resolve(content, depth=0, max_depth=2):
-        """
-        Recursively resolve a request on-device.
-        1. Try fast-path + self-consistency on the content.
-        2. If that fails and depth < max_depth, decompose and recurse.
-        Returns (calls_list_or_None, time_ms_spent).
-        """
-        msgs = non_user + [{"role": "user", "content": content}]
-        result, time_spent = _on_device(msgs, tools)
-        if result is not None:
-            return result["function_calls"], time_spent
-
-        if depth < max_depth:
-            parts = _decompose(content)
-            if len(parts) > 1:
-                all_calls = []
-                total_time = time_spent
-                for part in parts:
-                    part_calls, part_time = _resolve(part, depth + 1, max_depth)
-                    total_time += part_time
-                    if part_calls is None:
-                        return None, total_time
-                    all_calls.extend(part_calls)
-                return all_calls, total_time
-
-        return None, time_spent
-
-    # Step 1 + 2: fast-path then self-consistency on the full message.
-    result, spent_time = _on_device(messages, tools)
-    if result is not None:
-        result["source"] = "on-device"
-        return result
-
-    # Step 3: recursive decomposition.
     if user_msgs:
         sub_contents = _decompose(user_msgs[-1]["content"])
+
         if len(sub_contents) > 1:
-            all_calls = []
-            total_time = spent_time
-            success = True
+            all_calls  = []
+            spent_time = local["total_time_ms"]
+
             for sub_content in sub_contents:
-                calls, sub_time = _resolve(sub_content)
-                total_time += sub_time
-                if calls is None:
-                    success = False
-                    break
-                all_calls.extend(calls)
+                sub_msgs = non_user + [{"role": "user", "content": sub_content}]
+                sub_local = generate_cactus(sub_msgs, tools)
+                sub_corrected, sub_valid = _validate(sub_local["function_calls"], tools)
+                spent_time += sub_local["total_time_ms"]
 
-            if success:
-                return {
-                    "function_calls": all_calls,
-                    "total_time_ms": total_time,
-                    "source": "on-device",
-                }
+                if not (sub_valid and sub_local["confidence"] >= confidence_threshold):
+                    # Any failure -> single cloud call with the original message.
+                    cloud = generate_cloud(messages, tools)
+                    cloud["source"] = "cloud (fallback)"
+                    cloud["total_time_ms"] += spent_time
+                    return cloud
 
-            cloud = generate_cloud(messages, tools)
-            cloud["source"] = "cloud (fallback)"
-            cloud["total_time_ms"] += total_time
-            return cloud
+                all_calls.extend(sub_corrected)
 
-    # Step 4: cloud fallback.
+            return {
+                "function_calls": all_calls,
+                "total_time_ms": spent_time,
+                "source": "on-device",
+            }
+
+    # Step 3: cloud fallback.
     cloud = generate_cloud(messages, tools)
     cloud["source"] = "cloud (fallback)"
-    cloud["total_time_ms"] += spent_time
+    cloud["local_confidence"] = local["confidence"]
+    cloud["total_time_ms"] += local["total_time_ms"]
     return cloud
-
 
 def print_result(label, result):
     """Pretty-print a generation result."""
