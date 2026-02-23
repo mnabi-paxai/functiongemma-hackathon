@@ -57,7 +57,12 @@ def generate_cloud(messages, tools):
                 parameters=types.Schema(
                     type="OBJECT",
                     properties={
-                        k: types.Schema(type=v["type"].upper(), description=v.get("description", ""))
+                        k: types.Schema(
+                            type=v["type"].upper(),
+                            description=v.get("description", ""),
+                            **({"items": types.Schema(type=v["items"]["type"].upper())}
+                               if v.get("type") == "array" and "items" in v else {}),
+                        )
                         for k, v in t["parameters"]["properties"].items()
                     },
                     required=t["parameters"].get("required", []),

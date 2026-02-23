@@ -1,302 +1,236 @@
 #!/usr/bin/env python3
 """
-Voice-to-WhatsApp demo (laptop)
-
-What it does:
-- Continuously records short audio chunks from your microphone
-- Transcribes locally using Cactus Whisper (cactus_transcribe)
-- When it hears a WhatsApp command, it:
-  1) extracts (recipient, message) via your existing generate_hybrid tool-caller
-  2) opens WhatsApp Web and sends the message (Playwright automation)
-
-Important notes:
-- This is a demo script; it is intentionally simple and "chunked" (e.g., 4s audio windows).
-- WhatsApp Web requires you to scan a QR code on first run. The script uses a persistent
-  browser profile so you only need to scan once.
-
-Dependencies:
-- pip install sounddevice soundfile playwright
-- python -m playwright install
-
+Voice-to-WhatsApp Demo  (on-device, low-latency)
+=================================================
 Run:
-- python demo_whatsapp_voice.py
+    ./cactus/venv/bin/python3 demo_whatsapp_voice.py
 
-Stop:
-- Ctrl+C
+How it works:
+    1. Laptop waits silently, listening for your voice.
+    2. When it detects speech it starts recording.
+    3. When you stop talking it automatically captures and processes.
+    4. On-device Whisper (cactus_transcribe) converts speech to text.
+    5. On-device FunctionGemma (generate_hybrid) extracts recipient + message.
+    6. Playwright opens WhatsApp Web, finds the contact and sends the message.
 
-This file does NOT change your benchmark/leaderboard code.
+Example command to say:
+    "Send a WhatsApp message to Parsa saying hey, what's up?"
+
+Stop: Ctrl+C
 """
 
 import os
-import re
-import time
+import sys
 import json
+import time
 import tempfile
 from pathlib import Path
 
-# Audio capture
+import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-# Cactus (local)
-import sys
 sys.path.insert(0, "cactus/python/src")
+os.environ.setdefault("CACTUS_NO_CLOUD_TELE", "1")
 
 from cactus import cactus_init, cactus_transcribe, cactus_destroy
-from main import generate_hybrid  # re-use your existing routing + tool-call output
-
-# Browser automation (WhatsApp Web)
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from main import generate_hybrid, generate_cloud
+from playwright.sync_api import sync_playwright
 
 
-# -----------------------------
-# Config
-# -----------------------------
-WHISPER_WEIGHTS = os.environ.get("WHISPER_WEIGHTS", "weights/whisper-small")
-AUDIO_SR = int(os.environ.get("AUDIO_SR", "16000"))
-CHUNK_SECONDS = float(os.environ.get("CHUNK_SECONDS", "4.0"))
+# ── Config ────────────────────────────────────────────────────────────────────
 
-# "Command gate" phrases to reduce accidental sends.
-# You can expand these.
-COMMAND_TRIGGERS = (
-    "whatsapp",
-    "what's app",
-    "what app",
+WHISPER_WEIGHTS  = os.environ.get("WHISPER_WEIGHTS", "weights/whisper-small")
+AUDIO_SR         = 16000
+WHISPER_PROMPT   = "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>"
 
+# Voice activity detection
+VAD_CHUNK_MS       = 100    # analyse energy every 100 ms
+VAD_SPEECH_THRESH  = 0.015  # RMS threshold to consider "speech"
+VAD_SILENCE_SEC    = 1.2    # seconds of silence before stopping
+VAD_MAX_SEC        = 10.0   # hard cap per recording
+VAD_WAIT_SEC       = 8.0    # seconds to wait for speech before demo fallback
 
-)
+# Demo fallback — used when no voice is detected (processed via gemini-2.5-flash)
+FALLBACK_COMMAND   = "Send a WhatsApp to Parsa saying Hi"
 
-# Wake word(s). The assistant will only act on commands after hearing a wake word.
-# Examples the transcriber might output: "hey cactus", "hi cactus".
-WAKE_WORDS = tuple(w.strip().lower() for w in os.environ.get("WAKE_WORDS", "hey cactus,hi cactus").split(",") if w.strip())
-
-# How long (in seconds) the assistant stays "armed" after hearing the wake word.
-ARMED_SECONDS = float(os.environ.get("ARMED_SECONDS", "12"))
-
-
-# Persistent browser profile directory so WhatsApp login persists.
-PROFILE_DIR = Path(os.environ.get("WHATSAPP_PROFILE_DIR", ".whatsapp_profile")).resolve()
-
-# WhatsApp Web
+PROFILE_DIR      = Path(os.environ.get("WHATSAPP_PROFILE_DIR", ".whatsapp_profile")).resolve()
 WHATSAPP_WEB_URL = "https://web.whatsapp.com/"
 
-
-# -----------------------------
-# Tool schema for parsing intent
-# -----------------------------
 TOOL_WHATSAPP_SEND = {
     "name": "whatsapp_send",
     "description": (
-        "Send a WhatsApp message to a contact via WhatsApp Web. "
-        "Use this when the user asks to message someone on WhatsApp/WhatsApp."
+        "Send a WhatsApp message to a contact. "
+        "Call this whenever the user asks to send or message someone on WhatsApp."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "recipient": {"type": "string", "description": "Contact name exactly as it appears in WhatsApp"},
-            "message": {"type": "string", "description": "The message content to send"},
+            "recipient": {"type": "string", "description": "The contact name as spoken by the user"},
+            "message":   {"type": "string", "description": "The message text to send"},
         },
         "required": ["recipient", "message"],
     },
 }
 
-
 SYSTEM_PROMPT = (
     "You are a voice assistant. "
-    "When the user asks to message someone on WhatsApp, call whatsapp_send with recipient and message. "
-    "If recipient is ambiguous, use the name the user said verbatim. "
-    "Return ONLY tool calls; do not chat."
+    "When the user asks to send a WhatsApp message, call whatsapp_send "
+    "with the recipient name and the exact message text. "
+    "Output ONLY the tool call, no extra text."
 )
 
 
-# -----------------------------
-# Audio + Transcription
-# -----------------------------
-def record_chunk(seconds: float, sr: int) -> str:
-    """Record an audio chunk and return a path to a temporary WAV."""
-    frames = int(seconds * sr)
-    audio = sd.rec(frames, samplerate=sr, channels=1, dtype="float32")
-    sd.wait()
+# ── Voice activity detection + recording ─────────────────────────────────────
 
-    # Write to a temp WAV file
-    fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="cactus_chunk_")
+def record_on_voice(sr: int) -> np.ndarray | None:
+    """
+    Block until speech is detected, then record until silence.
+    Returns a float32 mono array ready for Whisper,
+    or None if no speech is detected within VAD_WAIT_SEC (triggers demo fallback).
+    """
+    chunk_frames   = int(sr * VAD_CHUNK_MS / 1000)
+    silence_chunks = int(VAD_SILENCE_SEC * 1000 / VAD_CHUNK_MS)
+    max_chunks     = int(VAD_MAX_SEC * 1000 / VAD_CHUNK_MS)
+    wait_chunks    = int(VAD_WAIT_SEC * 1000 / VAD_CHUNK_MS)
+
+    print("Listening...", end="", flush=True)
+
+    frames_captured = []
+    speech_started  = False
+    silent_count    = 0
+    waited_chunks   = 0
+
+    with sd.InputStream(samplerate=sr, channels=1, dtype="float32") as stream:
+        while True:
+            chunk, _ = stream.read(chunk_frames)
+            mono      = chunk.reshape(-1)
+            rms       = float(np.sqrt(np.mean(mono ** 2)))
+
+            if not speech_started:
+                waited_chunks += 1
+                if rms >= VAD_SPEECH_THRESH:
+                    speech_started = True
+                    print(" Recording...", end="", flush=True)
+                    frames_captured.append(mono.copy())
+                    silent_count = 0
+                elif waited_chunks >= wait_chunks:
+                    print(" (no voice detected — using demo fallback)")
+                    return None          # triggers Gemini fallback
+            else:
+                frames_captured.append(mono.copy())
+                if rms < VAD_SPEECH_THRESH:
+                    silent_count += 1
+                    if silent_count >= silence_chunks:
+                        break
+                else:
+                    silent_count = 0
+                if len(frames_captured) >= max_chunks:
+                    break
+
+    print()
+    if not frames_captured:
+        return None
+    return np.concatenate(frames_captured)
+
+
+# ── Transcription ─────────────────────────────────────────────────────────────
+
+def transcribe(whisper, audio: np.ndarray) -> tuple[str, float]:
+    """Run cactus_transcribe on a float32 array. Returns (text, elapsed_ms)."""
+    fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="cactus_")
     os.close(fd)
-    sf.write(wav_path, audio, sr)
-    return wav_path
-
-
-def transcribe_chunk(whisper, wav_path: str) -> str:
-    """Transcribe a WAV file with Cactus Whisper."""
-    # Prompt from README example for English transcription
-    prompt = "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>"
-    raw = cactus_transcribe(whisper, wav_path, prompt=prompt)
     try:
-        data = json.loads(raw)
-        return (data.get("response") or "").strip()
-    except json.JSONDecodeError:
-        return ""
+        sf.write(wav_path, audio, AUDIO_SR)
+        t0  = time.perf_counter()
+        raw = cactus_transcribe(whisper, wav_path, prompt=WHISPER_PROMPT)
+        ms  = (time.perf_counter() - t0) * 1000
+        try:
+            text = (json.loads(raw).get("response") or "").strip()
+        except json.JSONDecodeError:
+            text = ""
+        return text, ms
+    finally:
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
 
 
-def detect_wake_word(text: str) -> bool:
-    t = text.lower().strip()
-    return any(w in t for w in WAKE_WORDS)
+# ── Intent extraction ─────────────────────────────────────────────────────────
 
-
-def strip_wake_word_prefix(text: str) -> str:
+def extract_intent_cloud(text: str) -> tuple[dict | None, float]:
     """
-    If the user said "hey cactus, ..." remove the wake phrase so parsing is cleaner.
-    This is intentionally conservative: we only strip when the wake word appears near the start.
-    """
-    t = text.strip()
-    low = t.lower()
-    for w in WAKE_WORDS:
-        # wake word near the start (+ optional punctuation)
-        if low.startswith(w):
-            return t[len(w):].lstrip(" ,.:;!-")
-        # allow "hey cactus," with minor leading filler
-        m = re.match(rf"^\s*(?:hey|hi|hello)\s+cactus\b[ ,.:;!-]*", low, re.IGNORECASE)
-        if m:
-            return t[m.end():].lstrip(" ,.:;!-")
-    return t
-
-
-def looks_like_whatsapp_command(text: str) -> bool:
-    t = text.lower()
-    return any(k in t for k in COMMAND_TRIGGERS) and ("message" in t or "text" in t or "send" in t)
-
-# -----------------------------
-# Intent extraction
-# -----------------------------
-def extract_with_hybrid_llm(text: str) -> dict | None:
-    """
-    Use your existing generate_hybrid() to extract recipient+message as a tool call.
-
-    Returns: {"recipient": ..., "message": ...} or None
+    Fallback: use gemini-2.5-flash to extract recipient + message.
+    Returns (intent_dict_or_None, elapsed_ms).
     """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": text},
+        {"role": "user",   "content": text},
     ]
+    t0     = time.perf_counter()
+    result = generate_cloud(messages, [TOOL_WHATSAPP_SEND])
+    ms     = (time.perf_counter() - t0) * 1000
+
+    for call in (result.get("function_calls") or []):
+        if call.get("name") == "whatsapp_send":
+            args      = call.get("arguments", {})
+            recipient = (args.get("recipient") or "").strip()
+            message   = (args.get("message")   or "").strip()
+            if recipient and message:
+                return {"recipient": recipient, "message": message}, ms
+
+    return None, ms
+
+
+def extract_intent(text: str) -> tuple[dict | None, float, str]:
+    """
+    Use generate_hybrid (on-device FunctionGemma) to parse recipient + message.
+    Returns (intent_dict_or_None, elapsed_ms, source).
+    """
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": text},
+    ]
+    t0     = time.perf_counter()
     result = generate_hybrid(messages, [TOOL_WHATSAPP_SEND])
-    calls = result.get("function_calls", []) or []
-    for c in calls:
-        if c.get("name") == "whatsapp_send":
-            args = c.get("arguments", {}) or {}
-            r = (args.get("recipient") or "").strip()
-            m = (args.get("message") or "").strip()
-            if r and m:
-                return {"recipient": r, "message": m, "parse_source": result.get("source", "unknown")}
-    return None
+    ms     = (time.perf_counter() - t0) * 1000
+    source = result.get("source", "unknown")
+
+    for call in (result.get("function_calls") or []):
+        if call.get("name") == "whatsapp_send":
+            args      = call.get("arguments", {})
+            recipient = (args.get("recipient") or "").strip()
+            message   = (args.get("message")   or "").strip()
+            if recipient and message:
+                return {"recipient": recipient, "message": message}, ms, source
+
+    return None, ms, source
 
 
-def fallback_extract(text: str) -> dict | None:
-    """
-    Heuristic fallback if the model doesn't return a tool call.
-    Tries patterns like:
-      - "message Alice on whatsapp saying hello"
-      - "send a whatsapp to Bob: I'm late"
-    """
-    t = text.strip()
+# ── WhatsApp Web automation ───────────────────────────────────────────────────
 
-    # Common "to <name> ... say/saying <msg>" pattern
-    m = re.search(r"\b(?:message|text|send)\b\s+(?:a\s+)?(?:whatsapp\s+)?(?:to\s+)?([A-Z][\w\- ]{1,40}?)\s+(?:on\s+)?(?:whatsapp|what'?s\s*app)\b.*?\b(?:say|saying|that)\b\s+(.+)$", t, re.IGNORECASE)
-    if m:
-        return {"recipient": m.group(1).strip(), "message": m.group(2).strip(), "parse_source": "regex"}
-
-    # "whatsapp <name>: <msg>"
-    m = re.search(r"\b(?:whatsapp|what'?s\s*app)\b\s+([A-Z][\w\- ]{1,40}?)\s*[:\-]\s*(.+)$", t, re.IGNORECASE)
-    if m:
-        return {"recipient": m.group(1).strip(), "message": m.group(2).strip(), "parse_source": "regex"}
-
-    return None
-
-
-# -----------------------------
-# WhatsApp Web automation
-# -----------------------------
-def _try_fill(page, selectors, text, press_enter=False, timeout_ms=8000):
-    last_err = None
-    for sel in selectors:
-        try:
-            page.wait_for_selector(sel, timeout=timeout_ms)
-            page.click(sel)
-            page.fill(sel, text)
-            if press_enter:
-                page.keyboard.press("Enter")
-            return True
-        except Exception as e:
-            last_err = e
-    if last_err:
-        raise last_err
-    return False
-
-
-def ensure_whatsapp_logged_in(page, timeout_s: int = 120):
-    """
-    If not logged in, WhatsApp shows a QR code. We give the user time to scan it.
-    We consider "logged in" when the chat search box is visible.
-    """
-    # WhatsApp Web UI changes, so we try multiple selectors for the left search box.
-    search_selectors = [
-        'div[contenteditable="true"][data-tab="3"]',
-        'div[contenteditable="true"][data-tab="2"]',
-        'div[role="textbox"][contenteditable="true"]',
-    ]
-
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        for sel in search_selectors:
-            try:
-                if page.query_selector(sel):
-                    return
-            except Exception:
-                pass
-        time.sleep(1)
-
-    raise RuntimeError("Timed out waiting for WhatsApp Web login (scan the QR code).")
-
-
-def whatsapp_send_via_web(recipient: str, message: str):
-    """
-    Send a message via WhatsApp Web using a persistent Playwright profile.
-    """
+def whatsapp_send(recipient: str, message: str):
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-
     with sync_playwright() as p:
         browser = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=False,
+            user_data_dir=str(PROFILE_DIR), headless=False
         )
         page = browser.pages[0] if browser.pages else browser.new_page()
         page.goto(WHATSAPP_WEB_URL, wait_until="domcontentloaded")
+        _wait_for_login(page)
 
-        ensure_whatsapp_logged_in(page)
-
-        # 1) Search for recipient
-        # Try a few candidate selectors for the search field.
-        search_selectors = [
+        # Search for the contact
+        _fill_first(page, [
             'div[contenteditable="true"][data-tab="3"]',
             'div[contenteditable="true"][data-tab="2"]',
             'div[role="textbox"][contenteditable="true"]',
-        ]
-
-        # Clear any prior text (Ctrl/Cmd+A then Backspace)
-        page.keyboard.press("Control+A")
-        page.keyboard.press("Backspace")
-
-        _try_fill(page, search_selectors, recipient, press_enter=False)
-
-        # Wait briefly for results to populate
+        ], recipient)
         time.sleep(1.0)
 
-        # 2) Click the first matching chat in the results list
-        # WhatsApp Web often uses span[title="Name"] in the results.
-        candidate_chat_selectors = [
-            f'span[title="{recipient}"]',
-            f'text="{recipient}"',
-        ]
+        # Open the chat
         clicked = False
-        for sel in candidate_chat_selectors:
+        for sel in [f'span[title="{recipient}"]', f'text="{recipient}"']:
             try:
                 el = page.query_selector(sel)
                 if el:
@@ -306,90 +240,127 @@ def whatsapp_send_via_web(recipient: str, message: str):
             except Exception:
                 pass
         if not clicked:
-            # As a fallback, press Enter to open the top result.
             page.keyboard.press("Enter")
 
-        # 3) Type message in composer and send
-        composer_selectors = [
+        # Type and send
+        _fill_first(page, [
             'div[contenteditable="true"][data-tab="10"]',
             'div[contenteditable="true"][data-tab="9"]',
             'footer div[contenteditable="true"][role="textbox"]',
             'div[role="textbox"][contenteditable="true"]',
-        ]
-
-        _try_fill(page, composer_selectors, message, press_enter=False)
+        ], message)
         page.keyboard.press("Enter")
-
-        # Give a moment for send to complete
         time.sleep(1.0)
-
         browser.close()
 
 
-# -----------------------------
-# Main loop
-# -----------------------------
+def _wait_for_login(page, timeout_s: int = 120):
+    selectors = [
+        'div[contenteditable="true"][data-tab="3"]',
+        'div[contenteditable="true"][data-tab="2"]',
+        'div[role="textbox"][contenteditable="true"]',
+    ]
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        for sel in selectors:
+            try:
+                if page.query_selector(sel):
+                    return
+            except Exception:
+                pass
+        time.sleep(1)
+    raise RuntimeError("Timed out waiting for WhatsApp Web login. Scan the QR code.")
+
+
+def _fill_first(page, selectors: list, text: str, timeout_ms: int = 8000):
+    for sel in selectors:
+        try:
+            page.wait_for_selector(sel, timeout=timeout_ms)
+            page.click(sel)
+            page.fill(sel, text)
+            return
+        except Exception:
+            continue
+    raise RuntimeError("Could not find input field on WhatsApp Web.")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
-    print("\n🎙️  Voice-to-WhatsApp demo started.")
-    print("Listening continuously in short chunks (wake-word required).")
-    print(f"Chunk length: {CHUNK_SECONDS}s | Sample rate: {AUDIO_SR}Hz")
-    print("Say something like: 'Hey Cactus, send a WhatsApp message to Alice saying I'm running late.'")
-    print("Stop with Ctrl+C.\n")
-
+    print("\n========================================")
+    print("  Voice-to-WhatsApp  (Powered by Cactus)")
+    print("========================================")
+    print(f"Loading Whisper weights: {WHISPER_WEIGHTS}")
     whisper = cactus_init(WHISPER_WEIGHTS)
-
-    armed_until = 0.0  # epoch seconds until which commands are accepted
+    print("Ready.\n")
+    print('Speak your command, e.g.:')
+    print('  "Send a WhatsApp message to Parsa saying hey, what\'s up?"\n')
+    print("Press Ctrl+C to quit.\n")
 
     try:
         while True:
-            wav_path = record_chunk(CHUNK_SECONDS, AUDIO_SR)
-            try:
-                text = transcribe_chunk(whisper, wav_path)
-            finally:
+            # ── Step 1: Record ──────────────────────────────────────
+            audio = record_on_voice(AUDIO_SR)
+
+            # No voice detected → demo fallback via gemini-2.5-flash
+            if audio is None:
+                print(f"  Fallback command: \"{FALLBACK_COMMAND}\"")
+                intent, t_intent = extract_intent_cloud(FALLBACK_COMMAND)
+                source = "gemini-2.5-flash (fallback)"
+                print(f"  Intent ({t_intent:.0f}ms, {source}): ", end="")
+                if not intent:
+                    print("failed to parse fallback.\n")
+                    continue
+                recipient = intent["recipient"]
+                message   = intent["message"]
+                print(f"recipient=\"{recipient}\"  message=\"{message}\"")
+                print(f"\n  Sending WhatsApp to '{recipient}'...")
+                t0 = time.perf_counter()
                 try:
-                    os.remove(wav_path)
-                except OSError:
-                    pass
+                    whatsapp_send(recipient, message)
+                    print(f"  Sent! ({(time.perf_counter()-t0)*1000:.0f}ms)\n")
+                except Exception as e:
+                    print(f"  ERROR: {e}\n")
+                continue
+
+            duration_s = audio.shape[0] / AUDIO_SR
+            if duration_s < 0.5:
+                print("(too short, ignored)\n")
+                continue
+
+            # ── Step 2: Transcribe (on-device Whisper) ──────────────
+            text, t_transcribe = transcribe(whisper, audio)
+            print(f"  Transcribed ({t_transcribe:.0f}ms): \"{text}\"")
 
             if not text:
-                continue
-            print(f"Heard: {text}")
-
-            # Wake-word gating:
-            # - If wake word is heard in this chunk, arm the assistant for ARMED_SECONDS.
-            # - If already armed (armed_until in the future), accept commands even without wake word.
-            now = time.time()
-            heard_wake = detect_wake_word(text)
-            if heard_wake:
-                armed_until = now + ARMED_SECONDS
-
-            if not heard_wake and now > armed_until:
-                # Ignore everything until wake word is spoken.
+                print("  Nothing recognised — try again.\n")
                 continue
 
-            # If wake word is present, strip it for cleaner parsing.
-            cleaned = strip_wake_word_prefix(text)
+            # ── Step 3: Extract intent (on-device FunctionGemma) ────
+            intent, t_intent, source = extract_intent(text)
+            print(f"  Intent ({t_intent:.0f}ms, {source}): ", end="")
 
-            if not looks_like_whatsapp_command(cleaned):
+            if not intent:
+                print("no WhatsApp command detected.")
+                print('  Try: "Send a WhatsApp to [name] saying [message]"\n')
                 continue
 
-            parsed = extract_with_hybrid_llm(cleaned) or fallback_extract(cleaned)
-            if not parsed:
-                print("Could not extract recipient/message yet. Try rephrasing.")
-                continue
+            recipient = intent["recipient"]
+            message   = intent["message"]
+            print(f"recipient=\"{recipient}\"  message=\"{message}\"")
 
-            recipient = parsed["recipient"]
-            message = parsed["message"]
-            print(f"→ Sending WhatsApp to '{recipient}': {message}  (parsed via {parsed.get('parse_source')})")
-
+            # ── Step 4: Send via WhatsApp Web ────────────────────────
+            print(f"\n  Sending WhatsApp to '{recipient}'...")
+            t0 = time.perf_counter()
             try:
-                whatsapp_send_via_web(recipient, message)
-                print("✅ Sent.\n")
+                whatsapp_send(recipient, message)
+                t_send = (time.perf_counter() - t0) * 1000
+                print(f"  Sent! ({t_send:.0f}ms)\n")
             except Exception as e:
-                print(f"❌ Failed to send via WhatsApp Web: {e}\n")
+                print(f"  ERROR sending: {e}\n")
 
     except KeyboardInterrupt:
-        print("\nStopping.")
+        print("\nStopped.")
     finally:
         cactus_destroy(whisper)
 
